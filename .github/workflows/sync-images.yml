@@ -1,0 +1,133 @@
+name: Sync RapidFort Curated Images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "images.csv"
+      - ".github/workflows/sync-images.yml"
+
+jobs:
+  sync-images:
+    runs-on: ubuntu-latest
+
+    env:
+      RF_ROOT_URL: https://us01.rapidfort.com
+      RF_REGISTRY: quay.io/rfcurated
+
+      # target registry settings
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+      # source registry creds
+      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+
+      # AWS creds for destination ECR
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # RapidFort service account creds
+      RF_ACCESS_ID: ${{ secrets.RF_ACCESS_ID }}
+      RF_SECRET_ACCESS_KEY: ${{ secrets.RF_SECRET_ACCESS_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq curl bash coreutils ca-certificates unzip
+          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          unzip -q awscliv2.zip
+          sudo ./aws/install
+          aws --version
+
+      - name: Prepare Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG=/tmp/docker-config
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s\n' '{"auths":{}}' > "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -sL \
+            "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+          crane version
+
+      - name: Install RapidFort CLI
+        run: |
+          set -euo pipefail
+          curl -sSL "$RF_ROOT_URL/cli" | bash
+          echo "$HOME/.rapidfort/bin" >> "$GITHUB_PATH"
+
+      - name: Login to Quay
+        run: |
+          set -euo pipefail
+          crane auth login quay.io -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD"
+
+      - name: Login to AWS ECR
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | crane auth login "$ECR_REGISTRY" -u AWS --password-stdin
+
+      - name: RapidFort login
+        env:
+          RF_ACCESS_ID: ${{ secrets.RF_ACCESS_ID }}
+          RF_SECRET_ACCESS_KEY: ${{ secrets.RF_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          rflogin
+
+      - name: Sync images
+        run: |
+          set -euo pipefail
+
+          if [ ! -f images.csv ]; then
+            echo "ERROR: images.csv not found in repo root"
+            exit 1
+          fi
+
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "Destination ECR repository: ${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          echo "Reading images.csv..."
+
+          tail -n +2 images.csv | while IFS=',' read -r REPO VERSION_GA TAGS || [ -n "${REPO:-}" ]; do
+            REPO="$(echo "${REPO:-}" | xargs)"
+            VERSION_GA="$(echo "${VERSION_GA:-}" | xargs)"
+            TAGS="$(echo "${TAGS:-}" | xargs)"
+
+            [ -z "$REPO" ] && continue
+
+            echo "------------------------------------------------------------"
+            echo "Repo=${REPO} version_ga=${VERSION_GA} tags=${TAGS}"
+            echo "Fetching RapidFort catalog..."
+
+            RF_OUTPUT="$(rfcatalog -r "${REPO}" -iv "^${VERSION_GA}" -t "${TAGS}" -f renovate)"
+            RELEASE_COUNT="$(echo "$RF_OUTPUT" | jq -r '.releases | length')"
+            echo "Found ${RELEASE_COUNT} release(s) to sync."
+
+            echo "$RF_OUTPUT" | jq -c '.releases[]' | while read -r ENTRY; do
+              VERSION="$(echo "${ENTRY}" | jq -r '.version')"
+              SOURCE_URL="$(echo "${ENTRY}" | jq -r '.sourceUrl')"
+              RF_REPO="$(echo "${SOURCE_URL}" | sed 's|https://quay.io/repository/rfcurated/||')"
+
+              SOURCE_IMAGE="${RF_REGISTRY}/${RF_REPO}:${VERSION}"
+              DEST_TAG="${REPO}-${VERSION}"
+              DEST_TAG="$(echo "$DEST_TAG" | tr '/' '-')"
+              DEST_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${DEST_TAG}"
+
+              echo "Copy: ${SOURCE_IMAGE} -> ${DEST_IMAGE}"
+              crane copy "${SOURCE_IMAGE}" "${DEST_IMAGE}"
+            done
+          done
