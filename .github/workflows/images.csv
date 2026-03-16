@@ -1,0 +1,3 @@
+repo,version_ga,tags
+alpine,3.21,!fips
+nginx,1.29.5,"!fips,jammy,rfhardened"
